@@ -16,6 +16,7 @@ import html # For decoding HTML entities
 import json # For playlist persistence
 import base64 # For encoding album art in JSON
 import mutagen
+import pathlib # <-- ADDED IMPORT
 from urllib.parse import urlparse, unquote
 from gi.repository import Gtk, Adw, Gio, GLib, GObject, Gst, GstPbutils, GdkPixbuf, Gdk # Added Gdk
 
@@ -77,7 +78,7 @@ class NamoWindow(Adw.ApplicationWindow):
         self._init_player()
 
         self.set_title("Namo Media Player")
-        self.set_default_size(600, 400)
+        self.set_default_size(400, 800)
 
         # --- Action Setup ---
         self._setup_actions()
@@ -112,6 +113,7 @@ class NamoWindow(Adw.ApplicationWindow):
         main_menu = Gio.Menu()
         main_menu.append("Open playlist", "win.open_playlist")
         main_menu.append("Save playlist", "win.save_playlist")
+        main_menu.append("Add Folder...", "win.add_folder") # Added Add Folder item
         # Add a section for About
         section = Gio.Menu()
         section.append("About", "win.about")
@@ -160,6 +162,7 @@ class NamoWindow(Adw.ApplicationWindow):
 
         self.cover_image = Gtk.Image.new_from_icon_name("audio-x-generic-symbolic") # Placeholder icon
         self.cover_image.set_pixel_size(64)
+        self.cover_image.add_css_class("album-art-image") # Add CSS class for styling
         song_info_box.append(self.cover_image)
 
         song_details_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
@@ -251,6 +254,10 @@ class NamoWindow(Adw.ApplicationWindow):
         about_action = Gio.SimpleAction.new("about", None)
         about_action.connect("activate", self._on_about_action)
         action_group.add_action(about_action)
+
+        add_folder_action = Gio.SimpleAction.new("add_folder", None)
+        add_folder_action.connect("activate", self._on_add_folder_action)
+        action_group.add_action(add_folder_action)
 
         self.insert_action_group("win", action_group)
 
@@ -446,10 +453,34 @@ class NamoWindow(Adw.ApplicationWindow):
         try:
             files = dialog.open_multiple_finish(result)
             if files:
-                print(f"Discovering {files.get_n_items()} files...")
+                print(f"Processing {files.get_n_items()} selected items...")
                 for i in range(files.get_n_items()):
-                    file = files.get_item(i)
-                    self._discover_and_add_uri(file.get_uri())
+                    gio_file = files.get_item(i) # Rename to gio_file for clarity
+                    if not gio_file: continue
+
+                    try:
+                        # Query file info to determine type
+                        info = gio_file.query_info(
+                            Gio.FILE_ATTRIBUTE_STANDARD_TYPE,
+                            Gio.FileQueryInfoFlags.NONE,
+                            None
+                        )
+                        file_type = info.get_file_type()
+
+                        if file_type == Gio.FileType.REGULAR:
+                            print(f"Adding regular file: {gio_file.get_uri()}")
+                            self._discover_and_add_uri(gio_file.get_uri()) # Existing async discovery for single files
+                        elif file_type == Gio.FileType.DIRECTORY:
+                            print(f"Starting scan for directory: {gio_file.get_path()}")
+                            self._start_folder_scan(gio_file) # New method for folders
+                        else:
+                            print(f"Skipping unsupported file type: {gio_file.get_path()}")
+
+                    except GLib.Error as info_err:
+                         print(f"Error querying info for {gio_file.peek_path()}: {info_err.message}", file=sys.stderr)
+                    except Exception as proc_err: # Catch other potential errors processing an item
+                         print(f"Error processing item {gio_file.peek_path()}: {proc_err}", file=sys.stderr)
+
         except GLib.Error as e:
             # Handle errors, specifically checking for user cancellation
             if e.matches(Gio.io_error_quark(), Gio.IOErrorEnum.CANCELLED):
@@ -457,15 +488,149 @@ class NamoWindow(Adw.ApplicationWindow):
             else:
                 # Treat other GLib errors as actual problems
                 print(f"Error opening files: {e.message}", file=sys.stderr)
+        except Exception as general_e: # Catch potential errors during finish() itself
+             print(f"Unexpected error during file dialog finish: {general_e}", file=sys.stderr)
 
+    def _start_folder_scan(self, folder_gio_file):
+        """Starts a background thread to scan a folder for audio files."""
+        folder_path = folder_gio_file.get_path()
+        if folder_path and os.path.isdir(folder_path):
+            print(f"Starting background scan thread for: {folder_path}")
+            thread = threading.Thread(target=self._scan_folder_thread, args=(folder_path,), daemon=True)
+            thread.start()
+        else:
+            print(f"Cannot scan folder: Invalid path or not a directory ({folder_path})", file=sys.stderr)
+
+    def _scan_folder_thread(self, folder_path):
+        """Background thread function to recursively scan a folder for audio files."""
+        print(f"Thread '{threading.current_thread().name}': Scanning {folder_path}")
+        audio_extensions = {".mp3", ".flac", ".ogg", ".opus", ".m4a", ".wav", ".aac"}
+        files_found = 0
+        files_added = 0
+
+        try:
+            for root, _, filenames in os.walk(folder_path):
+                for filename in filenames:
+                    if filename.lower().endswith(tuple(audio_extensions)):
+                        files_found += 1
+                        full_path = os.path.join(root, filename)
+                        try:
+                            file_uri = pathlib.Path(full_path).as_uri()
+                            # Call the *synchronous* discovery helper within the thread
+                            song_object = self._discover_uri_sync(file_uri, full_path)
+
+                            if song_object:
+                                files_added += 1
+                                # Schedule adding the song object to the store on the main thread
+                                GLib.idle_add(self.playlist_store.append, song_object)
+                                # Optional: Add a small sleep to avoid flooding GLib.idle_add
+                                # import time
+                                # time.sleep(0.01)
+                        except Exception as file_proc_err:
+                            print(f"Thread '{threading.current_thread().name}': Error processing file {full_path}: {file_proc_err}", file=sys.stderr)
+
+        except Exception as walk_err:
+            print(f"Thread '{threading.current_thread().name}': Error walking directory {folder_path}: {walk_err}", file=sys.stderr)
+
+        print(f"Thread '{threading.current_thread().name}': Finished scanning {folder_path}. Found: {files_found}, Added: {files_added}")
+
+
+    def _discover_uri_sync(self, uri, filepath):
+        """
+        Synchronous helper to discover metadata and art for a single file path.
+        Runs within the background folder scanning thread.
+        Uses Mutagen primarily. Returns a Song object or None.
+        """
+        # print(f"Sync Discover: {filepath}") # Debug: Uncomment if needed
+        mutagen_title = None
+        mutagen_artist = None
+        album_art_bytes = None
+        album_art_glib_bytes = None
+        duration_ns = 0 # Default duration
+
+        try:
+            if not os.path.exists(filepath):
+                 print(f"Sync Discover Error: File path does not exist: {filepath}", file=sys.stderr)
+                 return None
+
+            # 1. Attempt Mutagen for Tags + Art
+            try:
+                # Read easy tags first
+                audio_easy = mutagen.File(filepath, easy=True)
+                if audio_easy:
+                    mutagen_title = audio_easy.get('title', [None])[0]
+                    mutagen_artist = audio_easy.get('artist', [None])[0]
+                    # Try getting duration from easy tags if available (less common)
+                    duration_str = audio_easy.get('length', [None])[0]
+                    if duration_str:
+                        try: duration_ns = int(float(duration_str) * Gst.SECOND)
+                        except (ValueError, TypeError): pass # Ignore if invalid
+            except Exception as tag_e:
+                print(f"Sync Discover: Mutagen error reading easy tags from {filepath}: {tag_e}", file=sys.stderr)
+
+            # Read raw file for art separately (more reliable check)
+            try:
+                audio_raw = mutagen.File(filepath)
+                if audio_raw:
+                    # Get duration from raw info if not found via easy tags
+                    if duration_ns <= 0 and audio_raw.info and hasattr(audio_raw.info, 'length'):
+                        try: duration_ns = int(audio_raw.info.length * Gst.SECOND)
+                        except (ValueError, TypeError): pass
+
+                    # Art Extraction (similar logic to async version)
+                    if audio_raw.tags:
+                        if isinstance(audio_raw.tags, mutagen.id3.ID3) and 'APIC:' in audio_raw.tags:
+                            album_art_bytes = audio_raw.tags['APIC:'].data
+                        elif isinstance(audio_raw, mutagen.mp4.MP4) and 'covr' in audio_raw.tags and audio_raw.tags['covr']:
+                            album_art_bytes = bytes(audio_raw.tags['covr'][0])
+                        elif hasattr(audio_raw, 'pictures') and audio_raw.pictures:
+                            album_art_bytes = audio_raw.pictures[0].data
+
+                    # Wrap art bytes if found
+                    if album_art_bytes:
+                        try:
+                            album_art_glib_bytes = GLib.Bytes.new(album_art_bytes)
+                        except Exception as wrap_e:
+                            print(f"Sync Discover: Error wrapping album art bytes for {filepath}: {wrap_e}", file=sys.stderr)
+                            album_art_glib_bytes = None
+            except Exception as art_e:
+                 print(f"Sync Discover: Mutagen error reading raw file/art tags from {filepath}: {art_e}", file=sys.stderr)
+
+        except Exception as e:
+            print(f"Sync Discover: General Mutagen error for {filepath}: {e}", file=sys.stderr)
+            # Allow continuing to create Song with defaults if possible
+
+        # 2. Determine final metadata (Primarily from Mutagen)
+        # Use filename if title is still None after Mutagen
+        final_title = mutagen_title if mutagen_title else os.path.splitext(os.path.basename(filepath))[0]
+        final_artist = mutagen_artist # Keep None if Mutagen didn't find it
+        # Ensure duration is valid int >= 0
+        duration_to_store = duration_ns if isinstance(duration_ns, int) and duration_ns >= 0 else 0
+
+        # 3. Create the Song object
+        try:
+            song = Song(uri=uri, title=final_title, artist=final_artist, duration=duration_to_store)
+
+            # 4. Assign album art if found and wrapped successfully
+            if album_art_glib_bytes:
+                 song.album_art_data = album_art_glib_bytes
+
+            # print(f"Sync Discover OK: '{song.title}', Art: {song.album_art_data is not None}") # Debug
+            return song
+        except Exception as song_create_e:
+             print(f"Sync Discover: Error creating Song object for {filepath}: {song_create_e}", file=sys.stderr)
+             return None # Critical error creating the object
+
+    # --- Async Discovery (Keep for single files/URIs) ---
     def _discover_and_add_uri(self, uri):
-        """Starts asynchronous discovery for a given URI."""
-        print(f"Starting discovery for: {uri}")
+        # ... (existing async discovery code remains unchanged) ...
+        print(f"Starting ASYNC discovery for: {uri}") # Clarify it's async
         self.discoverer.discover_uri_async(uri)
 
     def _on_discoverer_discovered(self, discoverer, info, error):
         """Callback when GstDiscoverer finishes discovering a URI."""
-        print(f"--- _on_discoverer_discovered called for URI: {info.get_uri()} ---")
+        # ... (existing async discovery callback remains unchanged) ...
+        print(f"--- ASYNC _on_discoverer_discovered called for URI: {info.get_uri()} ---") # Clarify
         uri = info.get_uri()
 
         # Check for errors first
@@ -1157,6 +1322,51 @@ class NamoWindow(Adw.ApplicationWindow):
             else:
                 print(f"Error saving playlist file: {e.message}", file=sys.stderr)
                 # Consider showing an error dialog to the user
+
+    # --- Add Folder Action Handlers ---
+
+    def _on_add_folder_action(self, action, param):
+        """Handles the 'win.add_folder' action."""
+        dialog = Gtk.FileDialog.new()
+        dialog.set_title("Select Folder(s) to Add")
+        dialog.set_modal(True)
+        # No filters needed for folder selection
+
+        print("Opening folder selection dialog...")
+        dialog.select_multiple_folders(parent=self, cancellable=None,
+                                     callback=self._on_select_multiple_folders_finish)
+
+    def _on_select_multiple_folders_finish(self, dialog, result):
+        """Callback after the select_multiple_folders dialog closes."""
+        try:
+            folders = dialog.select_multiple_folders_finish(result)
+            if folders:
+                n_folders = folders.get_n_items()
+                print(f"Folders selected: {n_folders}")
+                for i in range(n_folders):
+                    folder_file = folders.get_item(i) # Gio.File object
+                    if folder_file:
+                        print(f"Processing selected folder: {folder_file.get_path()}")
+                        self._start_folder_scan(folder_file) # Use existing scan logic
+                    else:
+                        print(f"Warning: Got null folder item at index {i}")
+            else:
+                # This case might occur if finish() returns None even without error (unlikely but possible)
+                print("No folders selected or dialog closed unexpectedly.")
+
+        except GLib.Error as e:
+            # Handle errors, specifically checking for user cancellation
+            if e.matches(Gio.io_error_quark(), Gio.IOErrorEnum.CANCELLED):
+                print("Folder selection cancelled.")
+            else:
+                # Treat other GLib errors as actual problems
+                print(f"Error selecting folders: {e.message}", file=sys.stderr)
+                # Consider showing an error dialog to the user
+        except Exception as general_e: # Catch potential errors during finish() itself
+             print(f"Unexpected error during folder selection finish: {general_e}", file=sys.stderr)
+
+    # --- End Add Folder Action Handlers ---
+
 
     def _on_about_action(self, action, param):
         """Handles the 'win.about' action."""

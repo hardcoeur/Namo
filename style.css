@@ -26,3 +26,10 @@
     font-size: large;
     margin-bottom: 6px; /* Add some space below playlist title */
 }
+
+.album-art-image {
+    /* Add a subtle drop shadow */
+    box-shadow: 2px 2px 4px rgba(0, 0, 0, 0.205);
+    /* Optional: Add a small margin if the shadow gets clipped */
+    /* margin: 2px; */
+}
