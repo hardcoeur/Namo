@@ -1,6 +1,8 @@
 # Namo Media Player
-![screenshot of namo](promoresource/screenshot.png)
+
 Namo is a simple GTK4/Adwaita based media player written in Python, focusing on local music playback and basic library management.
+
+![screenshot of namo](promoresource/screenshot.png)
 
 ## Features
 
