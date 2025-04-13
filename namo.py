@@ -18,7 +18,7 @@ import base64 # For encoding album art in JSON
 import mutagen
 import pathlib # <-- ADDED IMPORT
 from urllib.parse import urlparse, unquote
-from gi.repository import Gtk, Adw, Gio, GLib, GObject, Gst, GstPbutils, GdkPixbuf, Gdk # Added Gdk
+from gi.repository import Gtk, Adw, Gio, GLib, GObject, Gst, GstPbutils, GdkPixbuf, Gdk, Pango # Added Gdk and Pango
 
 # --- Import bandcamp scraper manually due to directory name ---
 bc_scraper = None
@@ -76,12 +76,10 @@ class NamoWindow(Adw.ApplicationWindow):
         self._seek_value_ns = 0 # Store the target seek time during drag
         self._was_playing_before_seek = False # Track player state before seek starts
         self._init_player()
+        self._setup_actions() # <-- RESTORED ACTION SETUP CALL
 
         self.set_title("Namo Media Player")
         self.set_default_size(400, 800)
-
-        # --- Action Setup ---
-        self._setup_actions()
 
         # Use ToolbarView for header + content structure
         toolbar_view = Adw.ToolbarView()
@@ -109,20 +107,20 @@ class NamoWindow(Adw.ApplicationWindow):
 
         header.pack_start(playback_box)
 
-        # --- Main Menu Button ---
+        # --- Main Menu Button (using Gio.Menu) --- <-- RESTORED COMMENT
         main_menu = Gio.Menu()
-        main_menu.append("Open playlist", "win.open_playlist")
-        main_menu.append("Save playlist", "win.save_playlist")
-        main_menu.append("Add Folder...", "win.add_folder") # Added Add Folder item
-        # Add a section for About
+        # Add items (adjust order/sections as desired)
+        main_menu.append("Open Playlist", "win.open_playlist")
+        main_menu.append("Save Playlist", "win.save_playlist")
+        main_menu.append("Add Folder...", "win.add_folder_new") # Use the unique name
+        # Add separator/section if needed
         section = Gio.Menu()
         section.append("About", "win.about")
         main_menu.append_section(None, section)
 
         menu_button = Gtk.MenuButton.new()
         menu_button.set_icon_name("open-menu-symbolic")
-        menu_button.set_menu_model(main_menu)
-        # Menu button packed later
+        menu_button.set_menu_model(main_menu) # <-- RESTORED set_menu_model
 
         # Add Song/Album
         add_button = Gtk.Button.new_from_icon_name("list-add-symbolic")
@@ -146,7 +144,7 @@ class NamoWindow(Adw.ApplicationWindow):
         import_bc_button.set_tooltip_text("Import Bandcamp Album") # Add tooltip
         import_bc_button.connect("clicked", self._on_import_bandcamp_clicked)
         header.pack_end(import_bc_button) # Bandcamp button packed second
-        
+
 
         # --- Main Content Box (below header) ---
         main_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
@@ -170,6 +168,7 @@ class NamoWindow(Adw.ApplicationWindow):
         song_info_box.append(song_details_box)
 
         self.song_label = Gtk.Label(label="<Song Title>", xalign=0)
+        self.song_label.set_ellipsize(Pango.EllipsizeMode.END) # Enable ellipsizing
         self.song_label.add_css_class("title-5") # Adwaita style class
         song_details_box.append(self.song_label)
 
@@ -210,7 +209,7 @@ class NamoWindow(Adw.ApplicationWindow):
 
         scrolled_window = Gtk.ScrolledWindow()
         scrolled_window.set_vexpand(True)
-        scrolled_window.set_hexpand(True)
+        scrolled_window.set_hexpand(False)
         scrolled_window.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
         main_box.append(scrolled_window)
 
@@ -229,6 +228,7 @@ class NamoWindow(Adw.ApplicationWindow):
         self.playlist_view = Gtk.ListView(model=self.selection_model,
                                           factory=factory)
         self.playlist_view.set_vexpand(True)
+        self.playlist_view.set_vexpand(False)
         scrolled_window.set_child(self.playlist_view)
 
         # Add key controller for delete/backspace
@@ -239,8 +239,9 @@ class NamoWindow(Adw.ApplicationWindow):
         # Load previous playlist (default location)
         self._load_playlist()
         self._update_remaining_time() # Add initial call here
+
+    # --- Action Setup --- <-- RESTORED METHOD
     def _setup_actions(self):
-        """Creates and adds actions for the window."""
         action_group = Gio.SimpleActionGroup()
 
         open_action = Gio.SimpleAction.new("open_playlist", None)
@@ -251,16 +252,15 @@ class NamoWindow(Adw.ApplicationWindow):
         save_action.connect("activate", self._on_save_playlist_action)
         action_group.add_action(save_action)
 
+        add_folder_action = Gio.SimpleAction.new("add_folder_new", None) # Unique name
+        add_folder_action.connect("activate", self._on_add_folder_action)
+        action_group.add_action(add_folder_action)
+
         about_action = Gio.SimpleAction.new("about", None)
         about_action.connect("activate", self._on_about_action)
         action_group.add_action(about_action)
 
-        add_folder_action = Gio.SimpleAction.new("add_folder", None)
-        add_folder_action.connect("activate", self._on_add_folder_action)
-        action_group.add_action(add_folder_action)
-
         self.insert_action_group("win", action_group)
-
 
     def _init_player(self):
         """Initialize GStreamer player and discoverer."""
@@ -276,6 +276,14 @@ class NamoWindow(Adw.ApplicationWindow):
             print("ERROR: Could not create GStreamer playbin element.", file=sys.stderr)
             # Handle error appropriately (e.g., disable playback features)
             return
+        # Create and attach the rgvolume element for ReplayGain
+        rgvolume = Gst.ElementFactory.make("rgvolume", "rgvolume")
+        if not rgvolume:
+            print("ERROR: Could not create rgvolume element.", file=sys.stderr)
+            return
+
+        #   Inject rgvolume into the audio path
+        self.player.set_property("audio-filter", rgvolume)
 
         # Set up bus message handling
         bus = self.player.get_bus()
@@ -332,14 +340,17 @@ class NamoWindow(Adw.ApplicationWindow):
 
     def _on_playlist_item_setup(self, factory, list_item):
         """Setup widgets for a song row."""
-        box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+        box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
         box.set_margin_start(6)
         box.set_margin_end(6)
         box.set_margin_top(3)
         box.set_margin_bottom(3)
 
         title_label = Gtk.Label(xalign=0, hexpand=True)
-        duration_label = Gtk.Label(xalign=1)
+        title_label.set_ellipsize(Pango.EllipsizeMode.END) # Enable ellipsizing
+        title_label.set_tooltip_text("") # Set empty tooltip initially
+        title_label.set_max_width_chars(40)
+        duration_label = Gtk.Label(xalign=1, hexpand=False)
         box.append(title_label)
         box.append(duration_label)
         list_item.set_child(box)
@@ -360,7 +371,9 @@ class NamoWindow(Adw.ApplicationWindow):
 
         song = list_item.get_item() # Get the Song object
 
-        title_label.set_label(f"{song.artist} - {song.title}")
+        full_title = f"{song.artist} - {song.title}"
+        title_label.set_label(full_title)
+        title_label.set_tooltip_text(full_title) # Set full text as tooltip
         # Format duration nicely if it's numeric (nanoseconds)
         # Format duration based on stored nanoseconds (int64)
         duration_ns = song.duration
@@ -493,6 +506,7 @@ class NamoWindow(Adw.ApplicationWindow):
 
     def _start_folder_scan(self, folder_gio_file):
         """Starts a background thread to scan a folder for audio files."""
+        # print(f"DEBUG: _start_folder_scan called with path: {folder_gio_file.get_path()}") # Removed debug print
         folder_path = folder_gio_file.get_path()
         if folder_path and os.path.isdir(folder_path):
             print(f"Starting background scan thread for: {folder_path}")
@@ -838,9 +852,10 @@ class NamoWindow(Adw.ApplicationWindow):
              print(f"Duration changed: {self.duration_ns / Gst.SECOND:.2f}s")
              if self.duration_ns > 0:
                  self.progress_scale.set_range(0, self.duration_ns / Gst.SECOND)
-                 self.progress_scale.set_sensitive(True) # Enable seeking now that duration is known
+                 self.progress_scale.set_sensitive(True) # Enable seeking/drag now that duration is known
              else:
                  self.progress_scale.set_range(0, 0) # Set to 0 if duration is invalid/unknown
+                 self.progress_scale.set_sensitive(False) # Disable if duration unknown
              GLib.idle_add(self._update_progress) # Update UI immediately
 
 
@@ -851,6 +866,7 @@ class NamoWindow(Adw.ApplicationWindow):
         if song:
             # Update Title/Artist Label
             self.song_label.set_label(f"{song.artist} - {song.title}")
+            self.song_label.set_tooltip_text(f"{song.artist} - {song.title}") # Set full text as tooltip
 
             # Update Time Label (Set to 0:00 / Duration)
             duration_ns = song.duration
@@ -885,6 +901,7 @@ class NamoWindow(Adw.ApplicationWindow):
             # Set default states if no song
             # print("_update_song_display: No song provided, setting default display.") # Debug
             self.song_label.set_label("<No Song Playing>")
+            self.song_label.set_tooltip_text("") # Clear tooltip when no song
             self.time_label.set_label("0:00 / 0:00")
             self.cover_image.set_from_icon_name("audio-x-generic-symbolic")
 
@@ -948,21 +965,14 @@ class NamoWindow(Adw.ApplicationWindow):
             return False
 
         # Query duration if we don't have it or it's invalid
+        # Query duration if we don't have it or it's invalid (but don't change scale props here)
         if self.duration_ns <= 0:
-             ok, self.duration_ns = self.player.query_duration(Gst.Format.TIME)
+             ok, new_duration_ns = self.player.query_duration(Gst.Format.TIME)
              if ok:
-                 if self.duration_ns > 0:
-                     self.progress_scale.set_range(0, self.duration_ns / Gst.SECOND)
-                     self.progress_scale.set_sensitive(True) # Sensitive only if duration > 0
-                 else:
-                     # Keep range 0-0 or 0-100? Let's reset to 0-100 and insensitive
-                     self.progress_scale.set_range(0, 100)
-                     self.progress_scale.set_sensitive(False)
+                 self.duration_ns = new_duration_ns # Update internal value if successful
              else:
-                 print("Could not query duration.")
+                 print("Could not query duration in timer.")
                  self.duration_ns = 0 # Reset if query failed
-                 self.progress_scale.set_range(0, 100) # Reset range
-                 self.progress_scale.set_sensitive(False) # Ensure insensitive
         # Query position
         ok_pos, position_ns = self.player.query_position(Gst.Format.TIME)
         pos_sec = 0 # Default if query fails
@@ -984,6 +994,7 @@ class NamoWindow(Adw.ApplicationWindow):
             adj.set_value(pos_sec)
 
 
+        # Keep timer running only if playing
         # Keep timer running only if playing
         if state == Gst.State.PLAYING:
             return True # Continue timer
@@ -1236,7 +1247,7 @@ class NamoWindow(Adw.ApplicationWindow):
         # else: Already at the end, do nothing (or loop?)
 
     # --- Playlist Open/Save Actions ---
-    def _on_open_playlist_action(self, action, param):
+    def _on_open_playlist_action(self, action, param): # <-- RESTORED SIGNATURE
         """Handles the 'win.open_playlist' action."""
         dialog = Gtk.FileDialog.new()
         dialog.set_title("Open Playlist")
@@ -1273,7 +1284,7 @@ class NamoWindow(Adw.ApplicationWindow):
                 print(f"Error opening playlist file: {e.message}", file=sys.stderr)
                 # Consider showing an error dialog to the user
 
-    def _on_save_playlist_action(self, action, param):
+    def _on_save_playlist_action(self, action, param): # <-- RESTORED SIGNATURE
         """Handles the 'win.save_playlist' action."""
         dialog = Gtk.FileDialog.new()
         dialog.set_title("Save Playlist As")
@@ -1325,8 +1336,8 @@ class NamoWindow(Adw.ApplicationWindow):
 
     # --- Add Folder Action Handlers ---
 
-    def _on_add_folder_action(self, action, param):
-        """Handles the 'win.add_folder' action."""
+    def _on_add_folder_action(self, action, param): # <-- RESTORED SIGNATURE
+        """Handles the 'win.add_folder_new' action."""
         dialog = Gtk.FileDialog.new()
         dialog.set_title("Select Folder(s) to Add")
         dialog.set_modal(True)
@@ -1368,7 +1379,7 @@ class NamoWindow(Adw.ApplicationWindow):
     # --- End Add Folder Action Handlers ---
 
 
-    def _on_about_action(self, action, param):
+    def _on_about_action(self, action, param): # <-- RESTORED SIGNATURE
         """Handles the 'win.about' action."""
         about_window = Adw.AboutWindow()
         about_window.set_transient_for(self)
