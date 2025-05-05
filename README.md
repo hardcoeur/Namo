@@ -53,4 +53,4 @@ sudo apt install python3 python3-gi python3-gi-cairo gir1.2-gtk-4.0 gir1.2-adw-1
 Navigate to the project's root directory in your terminal and run:
 
 ```bash
-python3 namo/namo.py
+python3 namo.py
