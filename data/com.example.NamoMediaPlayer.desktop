@@ -1,0 +1,13 @@
+[Desktop Entry]
+Name=Namo Media Player
+Comment=Play local music and Bandcamp streams
+# Use absolute path for Exec in current development context
+Path=/path/to/Namo
+Exec='/usr/bin/python3 /path/to/Namo/namo.py'
+Icon=audio-x-generic
+Terminal=false
+Type=Application
+Categories=AudioVideo;Audio;Player;
+StartupNotify=true
+# Use the same ID as in the Adw.Application
+StartupWMClass=com.example.NamoMediaPlayer
